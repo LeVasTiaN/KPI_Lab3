@@ -3,122 +3,136 @@ package painter
 import (
 	"image"
 	"image/color"
-	"sync"
 
 	"golang.org/x/exp/shiny/screen"
 )
 
-type Receiver interface {
-	Update(t screen.Texture)
+type Operation interface {
+	Do(state TextureState) TextureState
 }
 
-type Loop struct {
-	Receiver Receiver
+type OperationList []Operation
 
-	next    screen.Texture
-	prev    screen.Texture
-	state   TextureState
-	stateMu sync.RWMutex
-
-	mq       messageQueue
-	stopChan chan struct{}
-	stopReq  bool
-}
-
-var size = image.Pt(800, 800)
-
-type TextureState struct {
-	Background color.Color
-	BgRect     *BgRect
-	Figures    []Figure
-}
-
-func (l *Loop) Start(s screen.Screen) {
-	l.next, _ = s.NewTexture(size)
-	l.prev, _ = s.NewTexture(size)
-	if l.state.Background == nil {
-		l.state.Background = color.White
+func (ol OperationList) Do(state TextureState) TextureState {
+	for _, o := range ol {
+		state = o.Do(state)
 	}
-	l.stopChan = make(chan struct{})
-
-	go func() {
-		for {
-			select {
-			case <-l.stopChan: 
-				return
-			default:
-				op := l.mq.pull()
-				if op == nil {
-					break
-				}
-				l.stateMu.Lock()
-				updatedState := op.Do(l.state)
-				l.state = updatedState
-				l.drawFrame()
-				l.stateMu.Unlock()
-			}
-		}
-	}()
+	return state
 }
 
-func (l *Loop) drawFrame() {
-	l.next.Fill(l.next.Bounds(), l.state.Background, screen.Src)
+var UpdateOp = updateOp{}
 
-	if l.state.BgRect != nil {
-		l.state.BgRect.Draw(l.next)
+type updateOp struct{}
+
+func (op updateOp) Do(state TextureState) TextureState {
+	return state
+}
+
+type OperationFunc func(state TextureState) TextureState
+
+func (f OperationFunc) Do(state TextureState) TextureState {
+	return f(state)
+}
+
+type ColorFill struct {
+	Color color.Color
+}
+
+func (op ColorFill) Do(state TextureState) TextureState {
+	state.Background = op.Color
+	return state
+}
+
+type BgRect struct {
+	X1, Y1, X2, Y2 float64
+}
+
+func (op BgRect) Do(state TextureState) TextureState {
+	state.BgRect = &op
+	return state
+}
+
+func (op BgRect) Draw(t screen.Texture) {
+	bounds := t.Bounds()
+	rect := image.Rect(
+		int(float64(bounds.Dx())*op.X1),
+		int(float64(bounds.Dy())*op.Y1),
+		int(float64(bounds.Dx())*op.X2),
+		int(float64(bounds.Dy())*op.Y2),
+	)
+	t.Fill(rect, color.Black, screen.Src)
+}
+
+type Figure struct {
+	X, Y float64
+}
+
+func (op Figure) Do(state TextureState) TextureState {
+	state.Figures = append(state.Figures, op)
+	return state
+}
+
+func (op Figure) Draw(t screen.Texture) {
+	drawT90Figure(t, op.X, op.Y)
+}
+
+type Move struct {
+	X, Y float64
+}
+
+func (op Move) Do(state TextureState) TextureState {
+	for i := range state.Figures {
+		state.Figures[i].X = op.X
+		state.Figures[i].Y = op.Y
 	}
-
-	for _, fig := range l.state.Figures {
-		fig.Draw(l.next)
-	}
-	l.Receiver.Update(l.next)
-	l.next, l.prev = l.prev, l.next
+	return state
 }
 
-func (l *Loop) Post(op Operation) {
-	l.mq.push(op)
+type Reset struct{}
+
+func (op Reset) Do(state TextureState) TextureState {
+	state.Background = color.Black
+	state.BgRect = nil
+	state.Figures = nil
+	return state
 }
 
-func (l *Loop) StopAndWait() {
-	l.stopReq = true
-	close(l.stopChan)
-	l.mq.push(nil)
+func WhiteFill(state TextureState) TextureState {
+	state.Background = color.White
+	return state
 }
 
-type messageQueue struct {
-	ops  []Operation
-	mu   sync.Mutex
-	cond *sync.Cond
+func GreenFill(state TextureState) TextureState {
+	state.Background = color.RGBA{G: 0xff, A: 0xff}
+	return state
 }
 
-func (mq *messageQueue) push(op Operation) {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
-	mq.ops = append(mq.ops, op)
-	if mq.cond != nil {
-		mq.cond.Signal()
-	}
-}
+func drawT90Figure(t screen.Texture, x, y float64) {
+	bounds := t.Bounds()
+	centerX := int(float64(bounds.Max.X) * x)
+	centerY := int(float64(bounds.Max.Y) * y)
 
-func (mq *messageQueue) pull() Operation {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
+	verticalWidth := 50
+	verticalHeight := 200
+	horizontalWidth := 200
+	horizontalHeight := 50
 
-	for len(mq.ops) == 0 {
-		if mq.cond == nil {
-			mq.cond = sync.NewCond(&mq.mu)
-		}
-		mq.cond.Wait()
-	}
+	verticalRect := image.Rect(
+		centerX-horizontalWidth/2,
+		centerY-verticalHeight/2,
+		centerX-horizontalWidth/2+verticalWidth,
+		centerY+verticalHeight/2,
+	)
 
-	op := mq.ops[0]
-	mq.ops[0] = nil
-	mq.ops = mq.ops[1:]
-	return op
-}
+	horizontalRect := image.Rect(
+		centerX-horizontalWidth/2,
+		centerY-horizontalHeight/2,
+		centerX+horizontalWidth/2,
+		centerY+horizontalHeight/2,
+	)
 
-func (mq *messageQueue) empty() bool {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
-	return len(mq.ops) == 0
+	figureColor := color.RGBA{B: 255, A: 255}
+
+	t.Fill(verticalRect, figureColor, screen.Src)
+	t.Fill(horizontalRect, figureColor, screen.Src)
 }
