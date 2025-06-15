@@ -1,0 +1,63 @@
+@startuml
+title Component Dependency Diagram - KPI Lab 3
+
+component [Main] as main {
+  component [main.go] as maingo
+}
+
+package "Lang" {
+  component [HttpHandler] as httphandler
+  component [Parser] as parser
+}
+
+package "UI" {
+  component [Visualizer] as visualizer
+}
+
+package "Painter" {
+  component [Loop] as loop
+  component [Figure] as figure
+  component [BgRect] as bgrect
+  component [Reset] as reset
+  component [ColorFill] as colorfill
+  component [UpdateOp] as updateop
+  component [Move] as move
+  component [TextureState] as texturestate
+  component [Operation] as operation
+}
+
+component [screen.Texture] as screentexture
+component [screen.Window] as screenwindow
+
+maingo --> httphandler : "mounts on/, runs server"
+maingo --> visualizer : "calls Main()"
+
+httphandler --> parser : "uses"
+parser --> loop : "sends OperationList"
+
+visualizer --> loop : "sets Receiver, starts loop"
+visualizer --> screentexture : "draws image"
+visualizer --> screenwindow : "handles events"
+
+loop --> texturestate : "modifies state"
+loop --> operation : "calls Do()"
+
+figure ..|> operation
+bgrect ..|> operation  
+reset ..|> operation
+colorfill ..|> operation
+updateop ..|> operation
+move ..|> operation
+
+figure --> texturestate
+bgrect --> texturestate
+reset --> texturestate
+colorfill --> texturestate
+move --> texturestate
+
+updateop --> visualizer : "indirect interaction via Receiver"
+
+note right of httphandler : "creates parser"
+note right of visualizer : "indirect interaction via Receiver"
+
+@enduml
