@@ -1,48 +1,124 @@
 package painter
 
 import (
+	"image"
 	"image/color"
+	"sync"
 
 	"golang.org/x/exp/shiny/screen"
 )
 
-// Operation змінює вхідну текстуру.
-type Operation interface {
-	// Do виконує зміну операції, повертаючи true, якщо текстура вважається готовою для відображення.
-	Do(t screen.Texture) (ready bool)
+type Receiver interface {
+	Update(t screen.Texture)
 }
 
-// OperationList групує список операції в одну.
-type OperationList []Operation
+type Loop struct {
+	Receiver Receiver
 
-func (ol OperationList) Do(t screen.Texture) (ready bool) {
-	for _, o := range ol {
-		ready = o.Do(t) || ready
+	next    screen.Texture
+	prev    screen.Texture
+	state   TextureState
+	stateMu sync.RWMutex
+
+	mq       messageQueue
+	stopChan chan struct{}
+	stopReq  bool
+}
+
+var size = image.Pt(800, 800)
+
+type TextureState struct {
+	Background color.Color
+	BgRect     *BgRect
+	Figures    []Figure
+}
+
+func (l *Loop) Start(s screen.Screen) {
+	l.next, _ = s.NewTexture(size)
+	l.prev, _ = s.NewTexture(size)
+	if l.state.Background == nil {
+		l.state.Background = color.White
 	}
-	return
+	l.stopChan = make(chan struct{})
+
+	go func() {
+		for {
+			select {
+			case <-l.stopChan: 
+				return
+			default:
+				op := l.mq.pull()
+				if op == nil {
+					break
+				}
+				l.stateMu.Lock()
+				updatedState := op.Do(l.state)
+				l.state = updatedState
+				l.drawFrame()
+				l.stateMu.Unlock()
+			}
+		}
+	}()
 }
 
-// UpdateOp операція, яка не змінює текстуру, але сигналізує, що текстуру потрібно розглядати як готову.
-var UpdateOp = updateOp{}
+func (l *Loop) drawFrame() {
+	l.next.Fill(l.next.Bounds(), l.state.Background, screen.Src)
 
-type updateOp struct{}
+	if l.state.BgRect != nil {
+		l.state.BgRect.Draw(l.next)
+	}
 
-func (op updateOp) Do(t screen.Texture) bool { return true }
-
-// OperationFunc використовується для перетворення функції оновлення текстури в Operation.
-type OperationFunc func(t screen.Texture)
-
-func (f OperationFunc) Do(t screen.Texture) bool {
-	f(t)
-	return false
+	for _, fig := range l.state.Figures {
+		fig.Draw(l.next)
+	}
+	l.Receiver.Update(l.next)
+	l.next, l.prev = l.prev, l.next
 }
 
-// WhiteFill зафарбовує тестуру у білий колір. Може бути викоистана як Operation через OperationFunc(WhiteFill).
-func WhiteFill(t screen.Texture) {
-	t.Fill(t.Bounds(), color.White, screen.Src)
+func (l *Loop) Post(op Operation) {
+	l.mq.push(op)
 }
 
-// GreenFill зафарбовує тестуру у зелений колір. Може бути викоистана як Operation через OperationFunc(GreenFill).
-func GreenFill(t screen.Texture) {
-	t.Fill(t.Bounds(), color.RGBA{G: 0xff, A: 0xff}, screen.Src)
+func (l *Loop) StopAndWait() {
+	l.stopReq = true
+	close(l.stopChan)
+	l.mq.push(nil)
+}
+
+type messageQueue struct {
+	ops  []Operation
+	mu   sync.Mutex
+	cond *sync.Cond
+}
+
+func (mq *messageQueue) push(op Operation) {
+	mq.mu.Lock()
+	defer mq.mu.Unlock()
+	mq.ops = append(mq.ops, op)
+	if mq.cond != nil {
+		mq.cond.Signal()
+	}
+}
+
+func (mq *messageQueue) pull() Operation {
+	mq.mu.Lock()
+	defer mq.mu.Unlock()
+
+	for len(mq.ops) == 0 {
+		if mq.cond == nil {
+			mq.cond = sync.NewCond(&mq.mu)
+		}
+		mq.cond.Wait()
+	}
+
+	op := mq.ops[0]
+	mq.ops[0] = nil
+	mq.ops = mq.ops[1:]
+	return op
+}
+
+func (mq *messageQueue) empty() bool {
+	mq.mu.Lock()
+	defer mq.mu.Unlock()
+	return len(mq.ops) == 0
 }
